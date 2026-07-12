@@ -1,0 +1,886 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import { 
+  readDb, 
+  writeDb, 
+  hashPassword, 
+  generateSalt, 
+  seedDatabase, 
+  logAudit 
+} from "./src/server/db.js";
+import { 
+  processAICommand, 
+  processDocumentOCR 
+} from "./src/server/gemini.js";
+import crypto from "crypto";
+import { 
+  UserRole, 
+  PlanType, 
+  Product, 
+  StockMovement, 
+  FinancialTransaction, 
+  Company, 
+  User 
+} from "./src/types.js";
+
+// Session store in-memory for fast access
+const SESSIONS = new Map<string, {
+  userId: string;
+  username: string;
+  name: string;
+  role: UserRole;
+  companyId: string | null;
+}>();
+
+async function startServer() {
+  // Run seed database to create master admin or initial items
+  seedDatabase();
+
+  const app = express();
+  const PORT = 3000;
+
+  // Middleware to support large bodies for photos
+  app.use(express.json({ limit: "20mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+  // Request IP helper
+  const getIp = (req: express.Request) => {
+    return (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "127.0.0.1";
+  };
+
+  // Auth Middleware
+  const authenticateToken = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+
+    if (!token) {
+      res.status(401).json({ error: "Token de autenticação não fornecido." });
+      return;
+    }
+
+    const session = SESSIONS.get(token);
+    if (!session) {
+      res.status(403).json({ error: "Sessão expirada ou inválida." });
+      return;
+    }
+
+    // Attach to request
+    (req as any).session = session;
+    next();
+  };
+
+  // Admin Master only Middleware
+  const requireMaster = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const session = (req as any).session;
+    if (session.role !== UserRole.MASTER) {
+      res.status(403).json({ error: "Acesso restrito ao Administrador Master." });
+      return;
+    }
+    next();
+  };
+
+  // --- API ROUTES ---
+
+  // Health check
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", time: new Date().toISOString() });
+  });
+
+  // Login
+  app.post("/api/auth/login", (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      res.status(400).json({ error: "Usuário e senha são obrigatórios." });
+      return;
+    }
+
+    const db = readDb();
+    const user = db.users.find(u => u.username.toLowerCase() === username.toLowerCase());
+
+    if (!user || !user.active) {
+      res.status(401).json({ error: "Credenciais inválidas ou conta desativada." });
+      return;
+    }
+
+    const passwordHash = hashPassword(password, user.passwordSalt);
+    if (passwordHash !== user.passwordHash) {
+      res.status(401).json({ error: "Credenciais inválidas ou conta desativada." });
+      return;
+    }
+
+    // Generate token
+    const token = crypto.randomUUID();
+    const sessionData = {
+      userId: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+      companyId: user.companyId
+    };
+    SESSIONS.set(token, sessionData);
+
+    // Fetch company info if tenant user
+    let company: Company | null = null;
+    if (user.companyId) {
+      company = db.companies.find(c => c.id === user.companyId) || null;
+      if (company && company.subscriptionStatus === "blocked") {
+        res.status(403).json({ error: "Empresa bloqueada por inadimplência. Entre em contato com o suporte." });
+        return;
+      }
+    }
+
+    logAudit(user.companyId, user.id, user.name, "Login", "Login efetuado com sucesso", getIp(req));
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        forcePasswordReset: user.forcePasswordReset,
+        companyId: user.companyId
+      },
+      company
+    });
+  });
+
+  // Reset Password
+  app.post("/api/auth/reset-password", authenticateToken, (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    const session = (req as any).session;
+
+    if (!currentPassword || !newPassword) {
+      res.status(400).json({ error: "Campos obrigatórios ausentes." });
+      return;
+    }
+
+    const db = readDb();
+    const userIndex = db.users.findIndex(u => u.id === session.userId);
+    if (userIndex === -1) {
+      res.status(404).json({ error: "Usuário não encontrado." });
+      return;
+    }
+
+    const user = db.users[userIndex];
+    const passwordHash = hashPassword(currentPassword, user.passwordSalt);
+    if (passwordHash !== user.passwordHash) {
+      res.status(400).json({ error: "Senha atual incorreta." });
+      return;
+    }
+
+    // Update password
+    const newSalt = generateSalt();
+    user.passwordSalt = newSalt;
+    user.passwordHash = hashPassword(newPassword, newSalt);
+    user.forcePasswordReset = false; // password reset complete
+    
+    db.users[userIndex] = user;
+    writeDb(db);
+
+    logAudit(user.companyId, user.id, user.name, "Alteração de Senha", "Senha alterada com sucesso", getIp(req));
+
+    res.json({ success: true, message: "Senha alterada com sucesso." });
+  });
+
+  // Fetch Auth details
+  app.get("/api/auth/me", (req, res) => {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+
+    if (!token) {
+      res.status(401).json({ error: "Token não fornecido." });
+      return;
+    }
+
+    const session = SESSIONS.get(token);
+    if (!session) {
+      res.status(401).json({ error: "Sessão inválida." });
+      return;
+    }
+
+    const db = readDb();
+    const user = db.users.find(u => u.id === session.userId);
+    if (!user) {
+      res.status(404).json({ error: "Usuário não encontrado." });
+      return;
+    }
+
+    let company: Company | null = null;
+    if (user.companyId) {
+      company = db.companies.find(c => c.id === user.companyId) || null;
+    }
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        forcePasswordReset: user.forcePasswordReset,
+        companyId: user.companyId
+      },
+      company
+    });
+  });
+
+  // Logout
+  app.post("/api/auth/logout", authenticateToken, (req, res) => {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+    if (token) {
+      SESSIONS.delete(token);
+    }
+    res.json({ success: true });
+  });
+
+  // --- MASTER PANEL ENDPOINTS ---
+  
+  // Get all companies
+  app.get("/api/master/companies", authenticateToken, requireMaster, (req, res) => {
+    const db = readDb();
+    res.json(db.companies);
+  });
+
+  // Create company
+  app.post("/api/master/companies", authenticateToken, requireMaster, (req, res) => {
+    const { name, document, plan, subscriptionPrice, expirationDays } = req.body;
+    if (!name || !document) {
+      res.status(400).json({ error: "Nome e documento são obrigatórios." });
+      return;
+    }
+
+    const db = readDb();
+    const newCompany: Company = {
+      id: "company_" + crypto.randomUUID(),
+      name,
+      document,
+      active: true,
+      plan: plan || PlanType.SILVER,
+      subscriptionPrice: Number(subscriptionPrice) || 129.90,
+      subscriptionStatus: "active",
+      expirationDate: new Date(Date.now() + (expirationDays || 30) * 24 * 60 * 60 * 1000).toISOString(),
+      createdAt: new Date().toISOString()
+    };
+
+    db.companies.push(newCompany);
+    writeDb(db);
+
+    const session = (req as any).session;
+    logAudit(null, session.userId, session.name, "Cadastro de Empresa", `Empresa ${name} criada com sucesso`, getIp(req));
+
+    res.json(newCompany);
+  });
+
+  // Toggle company status
+  app.post("/api/master/companies/:id/toggle-status", authenticateToken, requireMaster, (req, res) => {
+    const { id } = req.params;
+    const db = readDb();
+    const companyIndex = db.companies.findIndex(c => c.id === id);
+
+    if (companyIndex === -1) {
+      res.status(404).json({ error: "Empresa não encontrada." });
+      return;
+    }
+
+    const company = db.companies[companyIndex];
+    company.subscriptionStatus = company.subscriptionStatus === "active" ? "blocked" : "active";
+    company.active = company.subscriptionStatus === "active";
+    
+    db.companies[companyIndex] = company;
+    writeDb(db);
+
+    const session = (req as any).session;
+    logAudit(null, session.userId, session.name, "Alteração de Status de Empresa", `Empresa ${company.name} status alterado para ${company.subscriptionStatus}`, getIp(req));
+
+    res.json(company);
+  });
+
+  // Get users
+  app.get("/api/master/users", authenticateToken, requireMaster, (req, res) => {
+    const db = readDb();
+    const safeUsers = db.users.map(u => ({
+      id: u.id,
+      companyId: u.companyId,
+      companyName: u.companyId ? (db.companies.find(c => c.id === u.companyId)?.name || "Inconhecido") : "Administrador Master",
+      username: u.username,
+      name: u.name,
+      email: u.email,
+      role: u.role,
+      active: u.active,
+      createdAt: u.createdAt
+    }));
+    res.json(safeUsers);
+  });
+
+  // Create user under tenant or master
+  app.post("/api/master/users", authenticateToken, requireMaster, (req, res) => {
+    const { companyId, username, name, email, password, role } = req.body;
+    if (!username || !name || !email || !password || !role) {
+      res.status(400).json({ error: "Campos obrigatórios ausentes." });
+      return;
+    }
+
+    const db = readDb();
+    
+    // Check if username taken
+    if (db.users.some(u => u.username.toLowerCase() === username.toLowerCase())) {
+      res.status(400).json({ error: "Nome de usuário já cadastrado." });
+      return;
+    }
+
+    const salt = generateSalt();
+    const newUser = {
+      id: "user_" + crypto.randomUUID(),
+      companyId: companyId || null,
+      username,
+      name,
+      email,
+      role: role as UserRole,
+      active: true,
+      forcePasswordReset: true, // Reset required on first login
+      createdAt: new Date().toISOString(),
+      passwordHash: hashPassword(password, salt),
+      passwordSalt: salt
+    };
+
+    db.users.push(newUser);
+    writeDb(db);
+
+    const session = (req as any).session;
+    logAudit(null, session.userId, session.name, "Criação de Usuário", `Usuário ${username} criado com sucesso`, getIp(req));
+
+    res.json({
+      id: newUser.id,
+      companyId: newUser.companyId,
+      username: newUser.username,
+      name: newUser.name,
+      email: newUser.email,
+      role: newUser.role,
+      active: newUser.active,
+      createdAt: newUser.createdAt
+    });
+  });
+
+  // Billing statistics
+  app.get("/api/master/billing", authenticateToken, requireMaster, (req, res) => {
+    const db = readDb();
+    const activeCompanies = db.companies.filter(c => c.subscriptionStatus === "active");
+    const totalBilling = db.companies.reduce((sum, c) => sum + (c.subscriptionStatus === "active" ? c.subscriptionPrice : 0), 0);
+    
+    // Monthly history estimates
+    const monthlyHistory = [
+      { name: "Mai", valor: totalBilling * 0.9 },
+      { name: "Jun", valor: totalBilling * 0.95 },
+      { name: "Jul", valor: totalBilling }
+    ];
+
+    res.json({
+      companiesCount: db.companies.length,
+      activeCompaniesCount: activeCompanies.length,
+      blockedCompaniesCount: db.companies.length - activeCompanies.length,
+      monthlyBilling: totalBilling,
+      history: monthlyHistory
+    });
+  });
+
+  // --- TENANT ENDPOINTS (filtered automatically by authenticated companyId) ---
+
+  // Get Products
+  app.get("/api/products", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    const companyProducts = db.products.filter(p => p.companyId === session.companyId);
+    res.json(companyProducts);
+  });
+
+  // Create Product
+  app.post("/api/products", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const { name, barcode, price, purchasePrice, stock, minStock, categoryId, supplierId, expirationDate } = req.body;
+    
+    if (!name || price === undefined) {
+      res.status(400).json({ error: "Nome e preço de venda são obrigatórios." });
+      return;
+    }
+
+    const db = readDb();
+    const newProduct: Product = {
+      id: "prod_" + crypto.randomUUID(),
+      companyId: session.companyId!,
+      name,
+      barcode: barcode || "",
+      price: Number(price),
+      purchasePrice: Number(purchasePrice) || 0,
+      stock: Number(stock) || 0,
+      minStock: Number(minStock) || 0,
+      categoryId: categoryId || "",
+      supplierId: supplierId || "",
+      expirationDate,
+      createdAt: new Date().toISOString()
+    };
+
+    db.products.push(newProduct);
+
+    // Record stock movement if initial stock > 0
+    if (newProduct.stock > 0) {
+      const movement: StockMovement = {
+        id: "move_" + crypto.randomUUID(),
+        companyId: session.companyId!,
+        productId: newProduct.id,
+        productName: newProduct.name,
+        type: "in",
+        quantity: newProduct.stock,
+        previousStock: 0,
+        newStock: newProduct.stock,
+        reason: "Ajuste Inicial",
+        userId: session.userId,
+        userName: session.name,
+        description: "Estoque inicial no cadastro do produto",
+        createdAt: new Date().toISOString()
+      };
+      db.stockMovements.push(movement);
+    }
+
+    writeDb(db);
+    logAudit(session.companyId, session.userId, session.name, "Criação de Produto", `Produto ${name} cadastrado`, getIp(req));
+
+    res.json(newProduct);
+  });
+
+  // Update Product
+  app.put("/api/products/:id", authenticateToken, (req, res) => {
+    const { id } = req.params;
+    const session = (req as any).session;
+    const { name, barcode, price, purchasePrice, stock, minStock, categoryId, supplierId, expirationDate } = req.body;
+
+    const db = readDb();
+    const productIndex = db.products.findIndex(p => p.id === id && p.companyId === session.companyId);
+
+    if (productIndex === -1) {
+      res.status(404).json({ error: "Produto não encontrado." });
+      return;
+    }
+
+    const product = db.products[productIndex];
+    const prevStock = product.stock;
+    const targetStock = Number(stock);
+
+    product.name = name !== undefined ? name : product.name;
+    product.barcode = barcode !== undefined ? barcode : product.barcode;
+    product.price = price !== undefined ? Number(price) : product.price;
+    product.purchasePrice = purchasePrice !== undefined ? Number(purchasePrice) : product.purchasePrice;
+    product.minStock = minStock !== undefined ? Number(minStock) : product.minStock;
+    product.categoryId = categoryId !== undefined ? categoryId : product.categoryId;
+    product.supplierId = supplierId !== undefined ? supplierId : product.supplierId;
+    product.expirationDate = expirationDate !== undefined ? expirationDate : product.expirationDate;
+
+    // Handle stock correction manually if altered directly
+    if (stock !== undefined && targetStock !== prevStock) {
+      product.stock = targetStock;
+      const movement: StockMovement = {
+        id: "move_" + crypto.randomUUID(),
+        companyId: session.companyId!,
+        productId: product.id,
+        productName: product.name,
+        type: targetStock > prevStock ? "in" : "out",
+        quantity: Math.abs(targetStock - prevStock),
+        previousStock: prevStock,
+        newStock: targetStock,
+        reason: "Ajuste",
+        userId: session.userId,
+        userName: session.name,
+        description: "Ajuste manual de estoque via ficha do produto",
+        createdAt: new Date().toISOString()
+      };
+      db.stockMovements.push(movement);
+    }
+
+    db.products[productIndex] = product;
+    writeDb(db);
+
+    logAudit(session.companyId, session.userId, session.name, "Atualização de Produto", `Produto ${product.name} atualizado`, getIp(req));
+    res.json(product);
+  });
+
+  // Delete Product
+  app.delete("/api/products/:id", authenticateToken, (req, res) => {
+    const { id } = req.params;
+    const session = (req as any).session;
+
+    const db = readDb();
+    const productIndex = db.products.findIndex(p => p.id === id && p.companyId === session.companyId);
+
+    if (productIndex === -1) {
+      res.status(404).json({ error: "Produto não encontrado." });
+      return;
+    }
+
+    const productName = db.products[productIndex].name;
+    db.products.splice(productIndex, 1);
+    writeDb(db);
+
+    logAudit(session.companyId, session.userId, session.name, "Exclusão de Produto", `Produto ${productName} excluído`, getIp(req));
+    res.json({ success: true });
+  });
+
+  // Get Categories
+  app.get("/api/categories", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    res.json(db.categories.filter(c => c.companyId === session.companyId));
+  });
+
+  // Create Category
+  app.post("/api/categories", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const { name } = req.body;
+    if (!name) {
+      res.status(400).json({ error: "Nome é obrigatório." });
+      return;
+    }
+
+    const db = readDb();
+    const newCat = {
+      id: "cat_" + crypto.randomUUID(),
+      companyId: session.companyId!,
+      name,
+      createdAt: new Date().toISOString()
+    };
+    db.categories.push(newCat);
+    writeDb(db);
+
+    logAudit(session.companyId, session.userId, session.name, "Criação de Categoria", `Categoria ${name} criada`, getIp(req));
+    res.json(newCat);
+  });
+
+  // Get Suppliers
+  app.get("/api/suppliers", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    res.json(db.suppliers.filter(s => s.companyId === session.companyId));
+  });
+
+  // Create Supplier
+  app.post("/api/suppliers", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const { name, contact, phone, email } = req.body;
+    if (!name) {
+      res.status(400).json({ error: "Nome é obrigatório." });
+      return;
+    }
+
+    const db = readDb();
+    const newSupplier = {
+      id: "sup_" + crypto.randomUUID(),
+      companyId: session.companyId!,
+      name,
+      contact: contact || "",
+      phone: phone || "",
+      email: email || "",
+      createdAt: new Date().toISOString()
+    };
+    db.suppliers.push(newSupplier);
+    writeDb(db);
+
+    logAudit(session.companyId, session.userId, session.name, "Criação de Fornecedor", `Fornecedor ${name} criado`, getIp(req));
+    res.json(newSupplier);
+  });
+
+  // Get Clients
+  app.get("/api/clients", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    res.json(db.clients.filter(c => c.companyId === session.companyId));
+  });
+
+  // Create Client
+  app.post("/api/clients", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const { name, phone, email, document } = req.body;
+    if (!name) {
+      res.status(400).json({ error: "Nome é obrigatório." });
+      return;
+    }
+
+    const db = readDb();
+    const newClient = {
+      id: "cli_" + crypto.randomUUID(),
+      companyId: session.companyId!,
+      name,
+      phone: phone || "",
+      email: email || "",
+      document: document || "",
+      createdAt: new Date().toISOString()
+    };
+    db.clients.push(newClient);
+    writeDb(db);
+
+    logAudit(session.companyId, session.userId, session.name, "Criação de Cliente", `Cliente ${name} criado`, getIp(req));
+    res.json(newClient);
+  });
+
+  // Get Financial Transactions
+  app.get("/api/financials", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    res.json(db.financials.filter(f => f.companyId === session.companyId));
+  });
+
+  // Create Financial Transaction
+  app.post("/api/financials", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const { type, category, amount, status, dueDate, paymentDate, description } = req.body;
+    if (!type || !category || amount === undefined) {
+      res.status(400).json({ error: "Campos obrigatórios ausentes." });
+      return;
+    }
+
+    const db = readDb();
+    const transaction: FinancialTransaction = {
+      id: "fin_" + crypto.randomUUID(),
+      companyId: session.companyId!,
+      type: type as "income" | "expense",
+      category,
+      amount: Number(amount),
+      status: status || "pending",
+      dueDate: dueDate || new Date().toISOString().split("T")[0],
+      paymentDate,
+      description: description || "",
+      createdAt: new Date().toISOString()
+    };
+
+    db.financials.push(transaction);
+    writeDb(db);
+
+    logAudit(session.companyId, session.userId, session.name, "Criação de Transação Financeira", `${type === "income" ? "Receita" : "Despesa"} de R$ ${amount} registrada`, getIp(req));
+    res.json(transaction);
+  });
+
+  // Update Financial Transaction status
+  app.patch("/api/financials/:id", authenticateToken, (req, res) => {
+    const { id } = req.params;
+    const session = (req as any).session;
+    const { status, paymentDate } = req.body;
+
+    const db = readDb();
+    const finIndex = db.financials.findIndex(f => f.id === id && f.companyId === session.companyId);
+
+    if (finIndex === -1) {
+      res.status(404).json({ error: "Transação não encontrada." });
+      return;
+    }
+
+    db.financials[finIndex].status = status;
+    if (status === "paid") {
+      db.financials[finIndex].paymentDate = paymentDate || new Date().toISOString().split("T")[0];
+    } else {
+      db.financials[finIndex].paymentDate = undefined;
+    }
+
+    writeDb(db);
+    logAudit(session.companyId, session.userId, session.name, "Atualização Financeira", `Status da transação alterado para ${status}`, getIp(req));
+    res.json(db.financials[finIndex]);
+  });
+
+  // Get Stock History
+  app.get("/api/stock-movements", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    res.json(db.stockMovements.filter(sm => sm.companyId === session.companyId));
+  });
+
+  // Get Audit Logs (only company matching logs)
+  app.get("/api/audit-logs", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const db = readDb();
+    res.json(db.auditLogs.filter(log => log.companyId === session.companyId));
+  });
+
+  // --- INTELLIGENT AI ASSISTANT ENDPOINTS ---
+
+  // Chat / Voice process command
+  app.post("/api/ai/command", authenticateToken, async (req, res) => {
+    const session = (req as any).session;
+    const { command, history } = req.body;
+
+    if (!command) {
+      res.status(400).json({ error: "Comando vazio." });
+      return;
+    }
+
+    try {
+      const aiResponse = await processAICommand(session.companyId!, command, history);
+      res.json(aiResponse);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // OCR Document / Invoice process
+  app.post("/api/ai/process-document", authenticateToken, async (req, res) => {
+    const session = (req as any).session;
+    const { base64Data, mimeType } = req.body;
+
+    if (!base64Data || !mimeType) {
+      res.status(400).json({ error: "Documento base64 e mimeType são necessários." });
+      return;
+    }
+
+    try {
+      const aiResponse = await processDocumentOCR(session.companyId!, base64Data, mimeType);
+      res.json(aiResponse);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Confirm AI Action (Executes the transaction: either Stock Entry or Sale)
+  app.post("/api/ai/confirm", authenticateToken, (req, res) => {
+    const session = (req as any).session;
+    const { type, products, supplierName, description } = req.body;
+
+    if (!type || !products || !Array.isArray(products) || products.length === 0) {
+      res.status(400).json({ error: "Dados da ação de confirmação inválidos." });
+      return;
+    }
+
+    const db = readDb();
+    const results: string[] = [];
+    let financialAmount = 0;
+
+    // Process each product in the action
+    for (const item of products) {
+      let product: Product | undefined;
+
+      // Find or Create Product
+      if (item.productId) {
+        product = db.products.find(p => p.id === item.productId && p.companyId === session.companyId);
+      }
+
+      // If ID empty, or not found, search by name in tenant
+      if (!product) {
+        product = db.products.find(p => p.name.toLowerCase() === item.productName.toLowerCase() && p.companyId === session.companyId);
+      }
+
+      // If still not found, create new product automatically
+      if (!product) {
+        product = {
+          id: "prod_" + crypto.randomUUID(),
+          companyId: session.companyId!,
+          name: item.productName,
+          barcode: "",
+          price: Number(item.price) || Number(item.purchasePrice) * 1.5 || 10.0,
+          purchasePrice: Number(item.purchasePrice) || Number(item.price) * 0.6 || 6.0,
+          stock: 0,
+          minStock: 10,
+          categoryId: "",
+          supplierId: "",
+          createdAt: new Date().toISOString()
+        };
+        db.products.push(product);
+        results.push(`Novo produto cadastrado: "${item.productName}"`);
+      }
+
+      const prevStock = product.stock;
+      let newStock = prevStock;
+
+      if (type === "stock_entry") {
+        newStock = prevStock + Number(item.quantity);
+        financialAmount += (product.purchasePrice * Number(item.quantity));
+      } else if (type === "sale") {
+        newStock = Math.max(0, prevStock - Number(item.quantity));
+        financialAmount += (product.price * Number(item.quantity));
+      }
+
+      product.stock = newStock;
+
+      // Record Stock Movement
+      const movement: StockMovement = {
+        id: "move_" + crypto.randomUUID(),
+        companyId: session.companyId!,
+        productId: product.id,
+        productName: product.name,
+        type: type === "stock_entry" ? "in" : "out",
+        quantity: Number(item.quantity),
+        previousStock: prevStock,
+        newStock: newStock,
+        reason: type === "stock_entry" ? "Compra" : "Venda",
+        userId: session.userId,
+        userName: session.name,
+        description: description || `Lançamento via Assistente de IA: ${type === "stock_entry" ? "Entrada" : "Saída"}`,
+        createdAt: new Date().toISOString()
+      };
+      db.stockMovements.push(movement);
+      results.push(`${product.name}: estoque alterado de ${prevStock} para ${newStock}`);
+    }
+
+    // Record Financial Transaction automatically
+    const finCategory = type === "stock_entry" ? "Compra" : "Venda";
+    const finType = type === "stock_entry" ? "expense" : "income";
+    const transaction: FinancialTransaction = {
+      id: "fin_" + crypto.randomUUID(),
+      companyId: session.companyId!,
+      type: finType,
+      category: finCategory,
+      amount: Number(financialAmount.toFixed(2)),
+      status: "paid", // Completed through stock confirmation
+      dueDate: new Date().toISOString().split("T")[0],
+      paymentDate: new Date().toISOString().split("T")[0],
+      description: description || `Lançamento automático de ${finCategory} via Assistente Inteligente`,
+      createdAt: new Date().toISOString()
+    };
+    db.financials.push(transaction);
+
+    // Save changes
+    writeDb(db);
+
+    // Audit logs
+    const actionLabel = type === "stock_entry" ? "Entrada de Estoque via IA" : "Venda via IA";
+    logAudit(
+      session.companyId,
+      session.userId,
+      session.name,
+      actionLabel,
+      `Confirmado lançamento de ${products.length} itens. Total Financeiro: R$ ${financialAmount.toFixed(2)}. ${results.join(", ")}`,
+      getIp(req)
+    );
+
+    res.json({
+      success: true,
+      message: `${actionLabel} registrado com sucesso.`,
+      financial: transaction,
+      details: results
+    });
+  });
+
+  // --- VITE MIDDLEWARE SETUP ---
+
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`ZPN Commerce server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();

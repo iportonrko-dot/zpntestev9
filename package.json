@@ -1,0 +1,6 @@
+{
+  "name": "ZPN Commerce",
+  "description": "Assistente Inteligente SaaS para simplificar a gestão de estoque, vendas e financeiro de pequenos comerciantes com IA conversacional.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
